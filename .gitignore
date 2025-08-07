@@ -1,0 +1,15 @@
+# Ignore data folder and environment
+data/
+.env
+*.venv/
+*.vscode/
+
+# Ignore Python artifacts
+__pycache__/
+*.pyc
+
+# Ignore log files
+*.log
+
+# Ignore Jupyter notebook checkpoints
+*.ipynb_checkpoints
