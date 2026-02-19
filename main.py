@@ -1,72 +1,153 @@
-from utils.retriever import retrieve, rerank_cross_encoder,rag_fusion_search
-from utils.prompt_builder import build_gemini_prompt
-from utils.retriever import print_retrieved_oneliners
-from utils.gemini import call_gemini, get_truncated_gemini_answer
-from flask import Flask, request, jsonify, render_template
+"""
+MAIN APPLICATION ENTRYPOINT
 
-app=Flask(__name__)
+This file orchestrates the full Medical RAG pipeline:
+
+User Question
+    ↓
+Local Retrieval (FAISS)
+    ↓
+Confidence Evaluation
+    ├── High confidence → Direct MedQuAD answer (NO LLM call)
+    └── Medium confidence → Gemini synthesis
+    ↓
+Emergency Detection
+    ↓
+Grounded Response + Citations
+
+Goal:
+Reduce Gemini usage (cost saving)
+Prevent hallucinations
+Provide explainable medical answers
+"""
+
+from flask import Flask, request, jsonify, render_template
+from dotenv import load_dotenv
+
+# --- Internal modules ---
+from utils.retriever import retrieve, compute_confidence, has_direct_answer
+from utils.prompt_builder import build_prompt
+from utils.safety import detect_emergency
+from utils.gemini import call_gemini
+
+
+# Load environment variables (.env)
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+
+
+# HOME ROUTE
 
 @app.route('/')
 def home():
+    """
+    Serves frontend UI.
+    """
     return render_template('index.html')
+
+
+# MAIN QUESTION ENDPOINT
 
 @app.route('/ask', methods=['POST'])
 def ask():
+    """
+    Core medical QA pipeline.
+
+    Steps:
+    1. Receive user query
+    2. Retrieve relevant medical chunks locally
+    3. Compute retrieval confidence
+    4. Skip Gemini if answer already exists
+    5. Otherwise synthesize using Gemini
+    6. Attach sources + safety warnings
+    """
+
+    # STEP 0: READ INPUT
     data = request.get_json() or {}
     query = data.get('question', '').strip()
 
-    top_k = 10
+    if not query:
+        return jsonify({"error": "Empty question"}), 400
 
     try:
-        def llm_generate_fn(prompt):
-            lm_prompt = f"Given the question: '{prompt}', generate 3 relevant follow-up or reworded questions, one per line."
-            response_text = call_gemini(lm_prompt, stream=False)  # Get full response, don't stream for simple QA
-            questions = [q.strip("-• \n") for q in response_text.split("\n") if q.strip()]
-            print("LLM generated questions:", questions)
-            return questions
+        # STEP 1 — LOCAL RETRIEVAL (NO LLM COST)
+        
+        results = retrieve(query, k=5)
 
-        # Use RAG Fusion to retrieve fused and reranked results
-        fused_candidates = rag_fusion_search(query, llm_generate_fn, k_per_query=5, top_k=10)
-
-        print_retrieved_oneliners(fused_candidates, max_items=3, maxlen=80)
-        # Step 1: Retrieve candidates
-        results = retrieve(query, k=top_k)
-
-        # Optional: print to console for debugging (comment out if unwanted)
-        print_retrieved_oneliners(results, max_items=3, maxlen=80)
-
-        # Step 2: Rerank candidates
-        reranked = rerank_cross_encoder(query, results)
-
-        # Step 3: Build Gemini prompt
-        gemini_prompt = build_gemini_prompt(query, reranked, max_contexts=3)
-
-        # Step 4: Call Gemini and stream the answer
-        answer_stream = call_gemini(gemini_prompt, stream=True)
-        truncated_answer = get_truncated_gemini_answer(answer_stream, max_words=40)
-
-        # Step 5: Prepare sources for output
-        sources = []
-        for item in reranked[:3]:
-            sources.append({
-                "question": item.get("question", "")[:60] + ("..." if len(item.get("question", "")) > 60 else ""),
-                "url": item.get("url", "N/A")
+        if not results:
+            return jsonify({
+                "answer": (
+                    "I could not find reliable medical information "
+                    "for this question. Please consult a healthcare professional."
+                ),
+                "sources": []
             })
 
-        # Return JSON response
+        # STEP 2 — CONFIDENCE SCORING
+        # Determines how strongly query matches dataset
+        confidence = compute_confidence(results)
+        print(f"Retrieval confidence: {confidence:.3f}")
+
+        # STEP 3 — EMERGENCY DETECTION (LOCAL RULES)
+        # Runs BEFORE LLM for safety
+        emergency_flag = detect_emergency(query, results)
+
+        # STEP 4 — LLM SKIP LOGIC (MAJOR COST SAVER)
+        # If MedQuAD already contains strong answer,
+        # we trust dataset instead of calling Gemini.
+        if has_direct_answer(results):
+
+            print("✅ High confidence match — skipping Gemini")
+
+            # Direct grounded answer from dataset
+            answer = results[0]["answer"]
+
+        else:
+            # Gemini only used when synthesis is required
+            print("🤖 Using Gemini synthesis")
+
+            gemini_prompt = build_prompt(
+                query,
+                results,
+                emergency_flag=emergency_flag
+            )
+
+            # Single LLM call (optimized)
+            answer = call_gemini(gemini_prompt, stream=False)
+
+        # STEP 5 — ADD SAFETY WARNING IF NEEDED
+        if emergency_flag:
+            answer += (
+                "\n\n⚠️ These symptoms may be serious. "
+                "Please consider contacting a healthcare professional."
+            )
+
+        # STEP 6 — PREPARE EXPLAINABLE SOURCES
+        sources = []
+        for item in results[:3]:
+            sources.append({
+                "question": item.get("question", "")[:80],
+                "source": item.get("source", "MedQuAD")
+            })
+
+        # STEP 7 — RETURN FINAL RESPONSE
         return jsonify({
-            # "answer": truncated_answer,
+            "answer": answer,
             "sources": sources
         })
 
+    # ERROR HANDLING
     except Exception as e:
-        # Return error info in JSON, ideally log error for debug too
-       return jsonify({
+        print("ERROR:", str(e))
+
+        return jsonify({
             "error": str(e),
             "type": type(e).__name__
         }), 500
 
 
+# RUN SERVER
 if __name__ == "__main__":
-    # Run Flask app with debug=true for development
     app.run(debug=True)
