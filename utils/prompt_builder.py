@@ -1,25 +1,38 @@
-def build_gemini_prompt(query, top_contexts, max_contexts=3, instruction=None):
-    """
-    Dynamically constructs a prompt for Gemini LLM using the top reranked Q&A pairs as context.
-    Args:
-        query (str): The user's question.
-        top_contexts (list): List of dicts with 'question' and 'answer' keys.
-        max_contexts (int): Number of context Q&A pairs to include.
-        instruction (str, optional): Custom instruction for LLM. If None, uses default.
-    Returns:
-        str: The constructed prompt.
-    """
-    context_strs = []
-    for i, item in enumerate(top_contexts[:max_contexts], 1):
-        context_strs.append(f"Q{i}: {item['question']}\nA{i}: {item['answer']}")
-    context_block = "\n\n".join(context_strs)
-    base_instruction = (
-        "Using only the above context, answer the user's question as accurately and concisely as possible. "
-        "If the answer is not found in the context, reply: 'Not found in context.'"
-    )
-    prompt = (
-        f"Context:\n{context_block}\n\n"
-        f"{instruction or base_instruction}\n"
-        f"User Question: {query}\n"
-    )
-    return prompt
+def build_prompt(query, contexts, emergency_flag):
+
+    context_text = ""
+    citations = []
+
+    for i, ctx in enumerate(contexts):
+        context_text += f"[{i+1}] {ctx['text']}\n"
+
+    warning = ""
+    if emergency_flag:
+        warning = """
+If symptoms appear serious, strongly advise consulting a doctor immediately.
+"""
+
+    prompt = f"""
+You are a careful medical assistant.
+
+Rules:
+- Answer ONLY using provided context
+- Do NOT invent information
+- Explain simply in plain English
+- Provide helpful advice
+- Mention when to see a doctor
+- Cite sources using numbers
+- If the answer is not found in context, reply: no found in context
+
+Context:
+{context_text}
+
+User Question:
+{query}
+
+{warning}
+
+Answer:
+"""
+
+    return prompt.strip()

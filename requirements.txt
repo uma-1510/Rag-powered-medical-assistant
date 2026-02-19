@@ -1,8 +1,10 @@
+python-dotenv
 pandas
 sentence_transformers
 faiss-cpu
-pickle
 dotenv
-google.generativeai
+google-genai
 flask
 flask-cors
+
+#pickle

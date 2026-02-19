@@ -1,3 +1,4 @@
+import re
 import pandas as pd 
 import faiss
 import pickle
@@ -10,22 +11,94 @@ CSV_PATH = "data/medquad.csv"
 INDEX_PATH = "data/faiss_index.index"
 METADATA_PATH= "data/metadata.pkl"
 EMBED_MODEL = "all-MiniLM-L6-v2"
-JSON_PATH= "data/bench_mark.json"
 
-def load_json_data(json_path:str):
-    with open(json_path,"r") as f:
-        data=json.load(f)
-    records=[]
-    medqa_data= data.get("medqa",{})
-    for key,entry in medqa_data.items():
-        question=entry.get("question", "")
-        options=entry.get("options","")
-        answer=entry.get("answer","")
+EMERGENCY_KEYWORDS = [
+    "chest pain",
+    "difficulty breathing",
+    "unconsious",
+    "severe bleeding",
+    "vision loss",
+    "head injury",
+    "vomitings",
+    "diaherra",
+    "more than 5 days"
+]
 
-        answer_text= options.get(answer,"") if options else ""
+def detect_emergency(text: str):
+    text_lower= text.lower()
+    return any(word in text_lower for word in EMERGENCY_KEYWORDS)
 
-        records.append({"question": question, "answer": answer_text})
-        return records
+def split_medical_sections(answer: str):
+    """
+    Docstring for split_medical_sections
+    
+    :param answer: Description
+    :type answer: str
+    Light heuristic section splitter.
+    Keeps your dataset intact but extracts context.
+
+    """
+    sections = {
+        "symptom": [],
+        "cause": [],
+        "treatment":[],
+        "warning": []
+    }
+    
+    sentences = re.split(r'(?<=[.!?])\s+', answer)
+
+    for s in sentences:
+        s_lower = s.lower()
+
+        if any(k in s_lower for k in ["symptom", "sign", "feel", "pain"]):
+            sections["symptom"].append(s)
+
+        elif any(k in s_lower for k in ["cause", "because", "due to"]):
+            sections["cause"].append(s)
+
+        elif any(k in s_lower for k in ["treat", "relief", "rest", "drink", "medicine"]):
+            sections["treatment"].append(s)
+
+        elif any(k in s_lower for k in ["doctor", "seek", "emergency", "serious"]):
+            sections["warning"].append(s)
+
+    return sections
+
+def build_medical_chunks(df):
+    """
+    Converts MedQuAD rows into context-aware chunks.
+    """
+
+    texts = []
+    metadata = []
+
+    for idx, row in df.iterrows():
+
+        question = str(row["question"])
+        answer = str(row["answer"])
+
+        sections = split_medical_sections(answer)
+
+        for chunk_type, sentences in sections.items():
+
+            if not sentences:
+                continue
+
+            chunk_text = question + " " + " ".join(sentences)
+
+            texts.append(chunk_text)
+
+            metadata.append({
+                "condition_question": question,
+                "chunk_type": chunk_type,
+                "text": chunk_text,
+                "source": "MedQuAD",
+                "source_id": f"medquad_{idx}",
+                "is_emergency": detect_emergency(chunk_text)
+            })
+
+    return texts, metadata
+
 
 def build_faiss_index(embeddings):
     dim= embeddings.shape[1]
@@ -42,51 +115,36 @@ def save_index_and_metadata(index, index_path,metadata_path,metadata):
 
 
 if __name__=="__main__":
-
+    
+    print("Loading dataset")
     df=pd.read_csv(CSV_PATH)
+    texts, combined_metadata = build_medical_chunks(df)
 
-    results= load_json_data(JSON_PATH)
+    print(f"Generated {len(texts)} medical chunks")
 
-    # new_json_records = [r for r in results if r["question"] not in texts]
-    # print(f"Filtered {len(new_json_records)} new JSON records to embed")
+    print("Loading embedding model...")
+    model = SentenceTransformer(EMBED_MODEL)
 
-    texts= (df["question"].astype(str) + "[SEP]" + df["answer"].astype(str)).tolist()
-    json_texts = [(rec["question"] + "[SEP]" + rec["answer"]) for rec in results]
-
-
-    print("loading model")
-    model= SentenceTransformer(EMBED_MODEL)
-    print(f"Encoding {len(texts)} passages...")
-    csv_embeddings= model.encode(
+    print("Encoding passages...")
+    embeddings = model.encode(
         texts,
-        progress_bar=True,
+        show_progress_bar=True,
         batch_size=64,
         convert_to_numpy=True,
         normalize_embeddings=True
     )
 
-    print(f"Encoding {len(json_texts)} new JSON passages...")
-    if len(json_texts) > 0:
-        json_embeddings = model.encode(
-            json_texts,
-            progress_bar=True,
-            batch_size=64,
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        )
-    else:
-        json_embeddings = np.empty((0, csv_embeddings.shape[1]), dtype=np.float32)
-    
-    combined_embeddings = np.concatenate([csv_embeddings, json_embeddings], axis=0)
+    index = build_faiss_index(embeddings)
 
-    medquad_metadata = df.to_dict(orient="records")
-    combined_metadata = medquad_metadata + json_texts
+    save_index_and_metadata(
+        index,
+        INDEX_PATH,
+        METADATA_PATH,
+        combined_metadata
+    )
 
-    
-    index= build_faiss_index(combined_embeddings)
-    save_index_and_metadata(index,INDEX_PATH,METADATA_PATH,combined_metadata)
     print(f"Metadata saved to {METADATA_PATH}")
-
     print("Embedding and indexing complete")
+
 
 

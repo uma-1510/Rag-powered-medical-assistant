@@ -3,6 +3,7 @@ data/
 .env
 *.venv/
 *.vscode/
+.env
 
 # Ignore Python artifacts
 __pycache__/
@@ -13,3 +14,5 @@ __pycache__/
 
 # Ignore Jupyter notebook checkpoints
 *.ipynb_checkpoints
+*.pkl
+*.index
